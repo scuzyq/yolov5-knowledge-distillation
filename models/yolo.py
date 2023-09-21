@@ -5,7 +5,7 @@ YOLO-specific modules
 Usage:
     $ python models/yolo.py --cfg yolov5s.yaml
 """
-
+import timm
 import argparse
 import contextlib
 import os
@@ -29,8 +29,7 @@ from utils.plots import feature_visualization
 from utils.torch_utils import (fuse_conv_and_bn, initialize_weights, model_info, profile, scale_img, select_device,
                                time_sync)
 
-from utils.anchor import make_center_anchors
-from utils.mask import center_to_corner, find_jaccard_overlap, corner_to_center
+from models.efficientViT import *
 
 try:
     import thop  # for FLOPs computation
@@ -114,25 +113,29 @@ class BaseModel(nn.Module):
     def forward(self, x, profile=False, visualize=False):
         return self._forward_once(x, profile, visualize)  # single-scale inference, train
 
-    def _forward_once(self, x, profile=False, visualize=False, target=None):
-        y, dt = [], []  # outputs
-        cnt = 0
-        for m in self.model:
-            if m.f != -1:  # if not from previous layer
-                x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]  # from earlier layers
-            if profile:
-                self._profile_one_layer(m, x, dt)
+    def _forward_once(self, x, profile=False, visualize=False):
+      y, dt = [], []  # outputs
+      for m in self.model:
+        if m.f != -1:  # if not from previous layer
+            x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]  # from earlier layers
+        if profile:
+            self._profile_one_layer(m, x, dt)
+        if hasattr(m, 'backbone'):
+            x = m(x)
+            for _ in range(5 - len(x)):
+                x.insert(0, None)
+            for i_idx, i in enumerate(x):
+                if i_idx in self.save:
+                    y.append(i)
+                else:
+                    y.append(None)
+            x = x[-1]
+        else:
             x = m(x)  # run
             y.append(x if m.i in self.save else None)  # save output
-            if visualize:
-                feature_visualization(x, m.type, m.i, save_dir=visualize)
-            if isinstance(m, Concat):
-                cnt += 1
-                if cnt == 2:
-                    feature = x
-        if target is not None:
-            return x, feature
-        return x
+        if visualize:
+            feature_visualization(x, m.type, m.i, save_dir=visualize)
+      return x
 
     def _profile_one_layer(self, m, x, dt):
         c = m == self.model[-1]  # is final layer, copy input as inplace fix
@@ -176,10 +179,6 @@ class DetectionModel(BaseModel):
     # YOLOv5 detection model
     def __init__(self, cfg='yolov5s.yaml', ch=3, nc=None, anchors=None):  # model, input channels, number of classes
         super().__init__()
-        self.anchors = [(1.3221, 1.73145), (3.19275, 4.00944), (5.05587, 8.09892), (9.47112, 4.84053),
-                        (11.2364, 10.0071)]
-        self.num_anchors = len(self.anchors)
-                        
         if isinstance(cfg, dict):
             self.yaml = cfg  # model dict
         else:  # is *.yaml
@@ -211,87 +210,16 @@ class DetectionModel(BaseModel):
             m.anchors /= m.stride.view(-1, 1, 1)
             self.stride = m.stride
             self._initialize_biases()  # only run once
-        
-        ## 바꾸기
+
         # Init weights, biases
         initialize_weights(self)
         self.info()
         LOGGER.info('')
-        
-    def _get_imitation_mask(self, x, targets, iou_factor=0.5):
-        """
-        gt_box: (B, K, 4) [x_min, y_min, x_max, y_max]
-        """
-        out_size = x.size(2)
-        batch_size = x.size(0)
-        device = targets.device
 
-        mask_batch = torch.zeros([batch_size, out_size, out_size])
-        
-        if not len(targets):
-            return mask_batch
-        
-        gt_boxes = [[] for i in range(batch_size)]
-        for i in range(len(targets)):
-            gt_boxes[int(targets[i, 0].data)] += [targets[i, 2:].clone().detach().unsqueeze(0)]
-        
-        max_num = 0
-        for i in range(batch_size):
-            max_num = max(max_num, len(gt_boxes[i]))
-            if len(gt_boxes[i]) == 0:
-                gt_boxes[i] = torch.zeros((1, 4), device=device)
-            else:
-                gt_boxes[i] = torch.cat(gt_boxes[i], 0)
-        
-        for i in range(batch_size):
-            # print(gt_boxes[i].device)
-            if max_num - gt_boxes[i].size(0):
-                gt_boxes[i] = torch.cat((gt_boxes[i], torch.zeros((max_num - gt_boxes[i].size(0), 4), device=device)), 0)
-            gt_boxes[i] = gt_boxes[i].unsqueeze(0)
-                
-        
-        gt_boxes = torch.cat(gt_boxes, 0)
-        gt_boxes *= out_size
-        
-        center_anchors = make_center_anchors(anchors_wh=self.anchors, grid_size=out_size, device=device)
-        anchors = center_to_corner(center_anchors).view(-1, 4)  # (N, 4)
-        
-        gt_boxes = center_to_corner(gt_boxes)
-
-        mask_batch = torch.zeros([batch_size, out_size, out_size], device=device)
-
-        for i in range(batch_size):
-            num_obj = gt_boxes[i].size(0)
-            if not num_obj:
-                continue
-             
-            IOU_map = find_jaccard_overlap(anchors, gt_boxes[i], 0).view(out_size, out_size, self.num_anchors, num_obj)
-            max_iou, _ = IOU_map.view(-1, num_obj).max(dim=0)
-            mask_img = torch.zeros([out_size, out_size], dtype=torch.int64, requires_grad=False).type_as(x)
-            threshold = max_iou * iou_factor
-
-            for k in range(num_obj):
-
-                mask_per_gt = torch.sum(IOU_map[:, :, :, k] > threshold[k], dim=2)
-
-                mask_img += mask_per_gt
-
-                mask_img += mask_img
-            mask_batch[i] = mask_img
-
-        mask_batch = mask_batch.clamp(0, 1)
-        return mask_batch  # (B, h, w)
-
-    def forward(self, x, augment=False, profile=False, visualize=False, target=None):
+    def forward(self, x, augment=False, profile=False, visualize=False):
         if augment:
             return self._forward_augment(x)  # augmented inference, None
-            
-        if target != None:
-            # x_center, y_center, width, height
-            preds, features = self._forward_once(x, profile, visualize, target)
-            mask = self._get_imitation_mask(features, target).unsqueeze(1)
-            return preds, features, mask
-        return self._forward_once(x, profile, visualize, target)  # single-scale inference, train
+        return self._forward_once(x, profile, visualize)  # single-scale inference, train
 
     def _forward_augment(self, x):
         img_size = x.shape[-2:]  # height, width
@@ -304,6 +232,7 @@ class DetectionModel(BaseModel):
             # cv2.imwrite(f'img_{si}.jpg', 255 * xi[0].cpu().numpy().transpose((1, 2, 0))[:, :, ::-1])  # save
             yi = self._descale_pred(yi, fi, si, img_size)
             y.append(yi)
+        y = self._clip_augmented(y)  # clip augmented tails
         return torch.cat(y, 1), None  # augmented inference, train
 
     def _descale_pred(self, p, flips, scale, img_size):
@@ -390,12 +319,20 @@ def parse_model(d, ch):  # model_dict, input_channels(3)
     na = (len(anchors[0]) // 2) if isinstance(anchors, list) else anchors  # number of anchors
     no = na * (nc + 5)  # number of outputs = anchors * (classes + 5)
 
+    is_backbone = False
     layers, save, c2 = [], [], ch[-1]  # layers, savelist, ch out
     for i, (f, n, m, args) in enumerate(d['backbone'] + d['head']):  # from, number, module, args
-        m = eval(m) if isinstance(m, str) else m  # eval strings
+        try:
+            t = m
+            m = eval(m) if isinstance(m, str) else m  # eval strings
+        except:
+            pass
         for j, a in enumerate(args):
             with contextlib.suppress(NameError):
-                args[j] = eval(a) if isinstance(a, str) else a  # eval strings
+                try:
+                    args[j] = eval(a) if isinstance(a, str) else a  # eval strings
+                except:
+                    args[j] = a
 
         n = n_ = max(round(n * gd), 1) if n > 1 else n  # depth gain
         if m in {
@@ -424,19 +361,36 @@ def parse_model(d, ch):  # model_dict, input_channels(3)
             c2 = ch[f] * args[0] ** 2
         elif m is Expand:
             c2 = ch[f] // args[0] ** 2
+        elif isinstance(m, str):
+            t = m
+            m = timm.create_model(m, pretrained=args[0], features_only=True)
+            c2 = m.feature_info.channels()
+        elif m in {efficientvit_b0,efficientvit_b1,efficientvit_b2,efficientvit_b3}:
+
+          m = m(*args)
+          c2 = m.channel
         else:
             c2 = ch[f]
-
-        m_ = nn.Sequential(*(m(*args) for _ in range(n))) if n > 1 else m(*args)  # module
-        t = str(m)[8:-2].replace('__main__.', '')  # module type
+        if isinstance(c2, list):
+            is_backbone = True
+            m_ = m
+            m_.backbone = True
+        else:
+            m_ = nn.Sequential(*(m(*args) for _ in range(n))) if n > 1 else m(*args)  # module
+            t = str(m)[8:-2].replace('__main__.', '')  # module type
         np = sum(x.numel() for x in m_.parameters())  # number params
-        m_.i, m_.f, m_.type, m_.np = i, f, t, np  # attach index, 'from' index, type, number params
+        m_.i, m_.f, m_.type, m_.np = i + 4 if is_backbone else i, f, t, np  # attach index, 'from' index, type, number params
         LOGGER.info(f'{i:>3}{str(f):>18}{n_:>3}{np:10.0f}  {t:<40}{str(args):<30}')  # print
-        save.extend(x % i for x in ([f] if isinstance(f, int) else f) if x != -1)  # append to savelist
+        save.extend(x % (i + 4 if is_backbone else i) for x in ([f] if isinstance(f, int) else f) if x != -1)  # append to savelist
         layers.append(m_)
         if i == 0:
             ch = []
-        ch.append(c2)
+        if isinstance(c2, list):
+            ch.extend(c2)
+            for _ in range(5 - len(ch)):
+                ch.insert(0, 0)
+        else:
+            ch.append(c2)
     return nn.Sequential(*layers), sorted(save)
 
 
